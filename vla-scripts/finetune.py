@@ -47,6 +47,11 @@ from prismatic.training.train_utils import (
 )
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.checkpoint_utils import (
+    ACTION_QUERIES_MODULE_NAME,
+    load_action_queries_state_dict,
+    save_action_queries_checkpoint,
+)
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -552,6 +557,7 @@ def save_training_checkpoint(
             vla.module.save_pretrained(checkpoint_dir) # directly save checkpoint without lora
         else:
             vla.module.save_pretrained(adapter_dir)
+            save_action_queries_checkpoint(vla, checkpoint_dir, checkpoint_name_suffix)
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
@@ -837,10 +843,18 @@ def finetune(cfg: FinetuneConfig) -> None:
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume:
+            adapter_dir = Path(cfg.resum_vla_path) / "lora_adapter"
+            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
+        else:
+            vla = get_peft_model(vla, lora_config)
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
+        if cfg.resume:
+            state_dict = load_checkpoint(ACTION_QUERIES_MODULE_NAME, cfg.resum_vla_path, cfg.resume_step)
+            load_action_queries_state_dict(vla, state_dict)
+            print("loaded action queries!!!!!!!!!")
         vla.print_trainable_parameters()
 
     else:
