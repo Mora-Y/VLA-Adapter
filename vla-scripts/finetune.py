@@ -47,6 +47,14 @@ from prismatic.training.train_utils import (
 )
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.checkpoint_utils import (
+    ACTION_QUERIES_MODULE_NAME,
+    load_action_queries_state_dict,
+    load_training_state_checkpoint,
+    save_action_queries_checkpoint,
+    save_training_state_checkpoint,
+    training_state_checkpoint_path,
+)
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -89,7 +97,7 @@ class FinetuneConfig:
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
     learning_rate: float = 5e-4                      # Learning rate
-    lr_warmup_steps: int = 0.1                       # Number of steps to warm up learning rate (from 10% to 100%)
+    lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
     num_steps_before_decay: int = 100000             # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
     max_steps: int = 200000                          # Max number of training steps
@@ -101,6 +109,7 @@ class FinetuneConfig:
                                                      #   (If False, saves all checkpoints)
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume_training_state: bool = True               # If True, restore optimizer/scheduler state when resuming
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -209,6 +218,34 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     print(f"Loading checkpoint: {checkpoint_path}")
     state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
     return remove_ddp_in_checkpoint(state_dict)
+
+
+def checkpoint_name_suffix_for_step(step: int) -> str:
+    return f"{step}_checkpoint.pt"
+
+
+def validate_resume_config(cfg: FinetuneConfig) -> None:
+    if not cfg.resume:
+        return
+
+    if cfg.resume_step is None:
+        raise ValueError("`--resume True` requires `--resume_step <step>`.")
+
+    resume_path = Path(cfg.resum_vla_path)
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint directory does not exist: {resume_path}")
+
+    if cfg.resume_training_state:
+        training_state_path = training_state_checkpoint_path(
+            resume_path,
+            checkpoint_name_suffix_for_step(cfg.resume_step),
+        )
+        if not training_state_path.exists():
+            raise FileNotFoundError(
+                f"Missing full training-state checkpoint: {training_state_path}. "
+                "This checkpoint can still be used as a model-only warm start by passing "
+                "`--resume_training_state False`, but it is not a faithful training resume."
+            )
 
 
 
@@ -497,6 +534,8 @@ def save_training_checkpoint(
     log_step,
     vla,
     processor,
+    optimizer,
+    scheduler,
     proprio_projector,
     noisy_action_projector,
     action_head,
@@ -514,6 +553,8 @@ def save_training_checkpoint(
         log_step (int): Current logging step.
         vla (OpenVLAForActionPrediction): Vision-language-action policy.
         processor (PrismaticProcessor): OpenVLA inputs processor.
+        optimizer (torch.optim.Optimizer): Optimizer state to resume training dynamics.
+        scheduler (torch.optim.lr_scheduler.LRScheduler): LR scheduler state to resume training dynamics.
         proprio_projector (nn.Module): Proprioceptive state projector module.
         noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
         action_head (nn.Module): Action head module.
@@ -529,7 +570,7 @@ def save_training_checkpoint(
         checkpoint_name_suffix = "latest_checkpoint.pt"
     else:
         checkpoint_dir = Path(str(run_dir) + f"--{log_step}_chkpt")
-        checkpoint_name_suffix = f"{log_step}_checkpoint.pt"
+        checkpoint_name_suffix = checkpoint_name_suffix_for_step(log_step)
 
     adapter_dir = checkpoint_dir / "lora_adapter"
 
@@ -552,6 +593,7 @@ def save_training_checkpoint(
             vla.module.save_pretrained(checkpoint_dir) # directly save checkpoint without lora
         else:
             vla.module.save_pretrained(adapter_dir)
+            save_action_queries_checkpoint(vla, checkpoint_dir, checkpoint_name_suffix)
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
@@ -570,6 +612,8 @@ def save_training_checkpoint(
             torch.save(
                 vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
             )
+
+        save_training_state_checkpoint(optimizer, scheduler, checkpoint_dir, checkpoint_name_suffix, log_step)
 
     # Wait for model components to be saved
     dist.barrier()
@@ -708,6 +752,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    validate_resume_config(cfg)
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.config_file_path = cfg.config_file_path.rstrip("/")
@@ -837,10 +882,18 @@ def finetune(cfg: FinetuneConfig) -> None:
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume:
+            adapter_dir = Path(cfg.resum_vla_path) / "lora_adapter"
+            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
+        else:
+            vla = get_peft_model(vla, lora_config)
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
+        if cfg.resume:
+            state_dict = load_checkpoint(ACTION_QUERIES_MODULE_NAME, cfg.resum_vla_path, cfg.resume_step)
+            load_action_queries_state_dict(vla, state_dict)
+            print("loaded action queries!!!!!!!!!")
         vla.print_trainable_parameters()
 
     else:
@@ -925,6 +978,30 @@ def finetune(cfg: FinetuneConfig) -> None:
     #         T_max=cfg.num_steps_before_decay, 
     #         eta_min=0.0001,          
     #         )
+    if cfg.resume:
+        checkpoint_name_suffix = checkpoint_name_suffix_for_step(cfg.resume_step)
+        if cfg.resume_training_state:
+            training_state = load_training_state_checkpoint(
+                cfg.resum_vla_path,
+                checkpoint_name_suffix,
+                map_location=torch.device("cuda", device_id),
+            )
+            if int(training_state["step"]) != int(cfg.resume_step):
+                raise ValueError(
+                    f"Training state step {training_state['step']} does not match "
+                    f"`--resume_step {cfg.resume_step}`."
+                )
+            optimizer.load_state_dict(training_state["optimizer"])
+            scheduler.load_state_dict(training_state["scheduler"])
+            torch.set_rng_state(training_state["torch_rng_state"].cpu())
+            if training_state.get("cuda_rng_state_all") is not None:
+                torch.cuda.set_rng_state_all([state.cpu() for state in training_state["cuda_rng_state_all"]])
+            print(f"Loaded optimizer/scheduler training state from step {cfg.resume_step}")
+        else:
+            print(
+                "WARNING: `--resume_training_state False` uses the checkpoint as a model-only "
+                "warm start. Optimizer and scheduler state will be reset."
+            )
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1013,7 +1090,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     }
 
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    completed_steps = int(cfg.resume_step or 0)
+    with tqdm.tqdm(total=cfg.max_steps, initial=completed_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1046,80 +1124,76 @@ def finetune(cfg: FinetuneConfig) -> None:
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
-            # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
-
-            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
-                current_lr = original_lr * (0.1 + 0.9 * lr_progress)
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = current_lr
-
-            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                # Log the learning rate
-                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
-                wandb.log(
-                    {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-                    },
-                    step=log_step,
-                )
-
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                next_step = completed_steps + 1
+                # [If applicable] Linearly warm up learning rate from 10% to 100% of original
+                if cfg.lr_warmup_steps > 0:
+                    lr_progress = min(next_step / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+                    current_lr = original_lr * (0.1 + 0.9 * lr_progress)
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = current_lr
+
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                completed_steps = next_step
                 progress.update()
 
-            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
-                save_training_checkpoint(
-                    cfg=cfg,
-                    run_dir=run_dir,
-                    log_step=log_step,
-                    vla=vla,
-                    processor=processor,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    noisy_action_projector=None,
-                    action_head=action_head,
-                    train_dataset=train_dataset,
-                    distributed_state=distributed_state,
-                    new_state_dict=RAW_STATE_DICT,
-                )
+                # Push Metrics to W&B (every wandb_log_freq optimizer steps)
+                if distributed_state.is_main_process and completed_steps % cfg.wandb_log_freq == 0:
+                    log_metrics_to_wandb(smoothened_metrics, "VLA Train", completed_steps, wandb)
+                    wandb.log(
+                        {
+                            "VLA Train/Learning Rate": optimizer.param_groups[0]["lr"],
+                        },
+                        step=completed_steps,
+                    )
 
-            # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
-                run_validation(
-                    vla=vla,
-                    action_head=action_head,
-                    noisy_action_projector=None,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    val_dataloader=val_dataloader,
-                    action_tokenizer=action_tokenizer,
-                    device_id=device_id,
-                    cfg=cfg,
-                    num_patches=NUM_PATCHES,
-                    log_step=log_step,
-                    distributed_state=distributed_state,
-                    val_time_limit=cfg.val_time_limit,
-                )
-                # Set model back to training mode after validation
-                vla.train()
+                # Save model checkpoint only after a complete optimizer step.
+                if completed_steps > 0 and completed_steps % cfg.save_freq == 0:
+                    save_training_checkpoint(
+                        cfg=cfg,
+                        run_dir=run_dir,
+                        log_step=completed_steps,
+                        vla=vla,
+                        processor=processor,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        noisy_action_projector=None,
+                        action_head=action_head,
+                        train_dataset=train_dataset,
+                        distributed_state=distributed_state,
+                        new_state_dict=RAW_STATE_DICT,
+                    )
 
-            # Stop training when max_steps is reached
-            if log_step == cfg.max_steps:
-                print(f"Max step {cfg.max_steps} reached! Stopping training...")
-                break
+                # Test model on validation set
+                if cfg.use_val_set and completed_steps > 0 and completed_steps % cfg.val_freq == 0:
+                    run_validation(
+                        vla=vla,
+                        action_head=action_head,
+                        noisy_action_projector=None,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        val_dataloader=val_dataloader,
+                        action_tokenizer=action_tokenizer,
+                        device_id=device_id,
+                        cfg=cfg,
+                        num_patches=NUM_PATCHES,
+                        log_step=completed_steps,
+                        distributed_state=distributed_state,
+                        val_time_limit=cfg.val_time_limit,
+                    )
+                    # Set model back to training mode after validation
+                    vla.train()
+
+                # Stop training when max_steps is reached
+                if completed_steps >= cfg.max_steps:
+                    print(f"Max step {cfg.max_steps} reached! Stopping training...")
+                    break
 
 
 if __name__ == "__main__":

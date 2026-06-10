@@ -24,6 +24,11 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models import load, load_vla
+from prismatic.vla.checkpoint_utils import (
+    ACTION_QUERIES_MODULE_NAME,
+    action_queries_checkpoint_path,
+    load_action_queries_state_dict,
+)
 
 
 
@@ -100,6 +105,21 @@ def main(cfg: ConvertConfig) -> None:
         "cuda"
     )
     merged_vla = merged_vla.merge_and_unload()
+
+    action_query_checkpoints = sorted(
+        Path(cfg.lora_finetuned_checkpoint_dir).glob(f"{ACTION_QUERIES_MODULE_NAME}--*checkpoint.pt")
+    )
+    if action_query_checkpoints:
+        action_query_checkpoint = action_query_checkpoints[-1]
+        print(f"Loading action queries from: {action_query_checkpoint}")
+        state_dict = torch.load(action_query_checkpoint, weights_only=True, map_location="cpu")
+        load_action_queries_state_dict(merged_vla, state_dict)
+    else:
+        print(
+            f"WARNING: no action query checkpoint found at "
+            f"{action_queries_checkpoint_path(cfg.lora_finetuned_checkpoint_dir, '*checkpoint.pt')}"
+        )
+
     merged_vla.save_pretrained(cfg.lora_finetuned_checkpoint_dir)
     print(f"\nMerging complete! Time elapsed (sec): {time.time() - start_time}")
     print(f"\nSaved merged model checkpoint at:\n{cfg.lora_finetuned_checkpoint_dir}")
