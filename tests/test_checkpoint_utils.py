@@ -15,6 +15,9 @@ action_queries_checkpoint_path = checkpoint_utils.action_queries_checkpoint_path
 extract_action_queries_state_dict = checkpoint_utils.extract_action_queries_state_dict
 load_action_queries_state_dict = checkpoint_utils.load_action_queries_state_dict
 save_action_queries_checkpoint = checkpoint_utils.save_action_queries_checkpoint
+save_training_state_checkpoint = checkpoint_utils.save_training_state_checkpoint
+load_training_state_checkpoint = checkpoint_utils.load_training_state_checkpoint
+training_state_checkpoint_path = checkpoint_utils.training_state_checkpoint_path
 
 
 class TinyVLA(torch.nn.Module):
@@ -61,6 +64,31 @@ class CheckpointUtilsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Action query shape mismatch"):
             load_action_queries_state_dict(target, {ACTION_QUERIES_KEY: torch.zeros(4, 5)})
+
+    def test_save_and_load_training_state_checkpoint(self):
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3], gamma=0.1)
+
+        loss = model(torch.ones(1, 2)).sum()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            save_training_state_checkpoint(optimizer, scheduler, tmp_path, "4_checkpoint.pt", step=4)
+            state = load_training_state_checkpoint(tmp_path, "4_checkpoint.pt")
+
+        self.assertEqual(state["step"], 4)
+        self.assertIn("state", state["optimizer"])
+        self.assertEqual(state["scheduler"]["last_epoch"], scheduler.state_dict()["last_epoch"])
+
+    def test_training_state_checkpoint_path(self):
+        self.assertEqual(
+            training_state_checkpoint_path("ckpt", "12_checkpoint.pt"),
+            Path("ckpt") / "training_state--12_checkpoint.pt",
+        )
 
 
 if __name__ == "__main__":

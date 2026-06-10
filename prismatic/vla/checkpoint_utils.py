@@ -1,16 +1,21 @@
 """Utilities for saving trainable VLA checkpoint components."""
 
 from pathlib import Path
-from typing import Dict, Union
+from typing import Any, Dict, Union
 
 import torch
 
 ACTION_QUERIES_KEY = "action_queries.weight"
 ACTION_QUERIES_MODULE_NAME = "action_queries"
+TRAINING_STATE_MODULE_NAME = "training_state"
 
 
 def action_queries_checkpoint_path(checkpoint_dir: Union[str, Path], checkpoint_name_suffix: str) -> Path:
     return Path(checkpoint_dir) / f"{ACTION_QUERIES_MODULE_NAME}--{checkpoint_name_suffix}"
+
+
+def training_state_checkpoint_path(checkpoint_dir: Union[str, Path], checkpoint_name_suffix: str) -> Path:
+    return Path(checkpoint_dir) / f"{TRAINING_STATE_MODULE_NAME}--{checkpoint_name_suffix}"
 
 
 def extract_action_queries_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -54,4 +59,33 @@ def save_action_queries_checkpoint(
     torch.save(
         extract_action_queries_state_dict(model),
         action_queries_checkpoint_path(checkpoint_dir, checkpoint_name_suffix),
+    )
+
+
+def save_training_state_checkpoint(
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    checkpoint_dir: Union[str, Path],
+    checkpoint_name_suffix: str,
+    step: int,
+) -> None:
+    torch.save(
+        {
+            "step": int(step),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+        training_state_checkpoint_path(checkpoint_dir, checkpoint_name_suffix),
+    )
+
+
+def load_training_state_checkpoint(
+    checkpoint_dir: Union[str, Path], checkpoint_name_suffix: str, map_location: Any = "cpu"
+) -> Dict[str, Any]:
+    return torch.load(
+        training_state_checkpoint_path(checkpoint_dir, checkpoint_name_suffix),
+        map_location=map_location,
+        weights_only=False,
     )
